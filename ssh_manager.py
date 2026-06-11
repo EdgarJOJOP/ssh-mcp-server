@@ -79,7 +79,9 @@ def _authenticate(
     password: Optional[str] = None,
     private_key: Optional[paramiko.PKey] = None,
     otp: Optional[str] = None,
-) -> None:
+    host: Optional[str] = None,
+    port: int = 22,
+) -> Transport:
     """
     按照 auth_methods 列表顺序进行多步认证。
     核心逻辑：
@@ -93,6 +95,9 @@ def _authenticate(
         - ["password", "otp"]        : 密码 + OTP（键盘交互）
         - ["key", "otp"]             : 密钥 + OTP（先密钥认证，再键盘交互提供 OTP）
         - ["key", "password", "otp"] : 密钥 + 密码 + OTP（部分服务器需要）
+
+    返回: 认证成功后的 Transport（如果 password 认证时服务器仅支持
+           keyboard-interactive，会重建 transport 后通过键盘交互认证）。
     """
     for method in auth_methods:
         # 如果已经认证成功，跳过后续步骤
@@ -104,9 +109,21 @@ def _authenticate(
                 raise ValueError("密码认证需要提供 password 参数")
             try:
                 transport.auth_password(username, password)
+            except BadAuthenticationType as bat:
+                # 服务端不支持 password 认证类型（例如仅支持 keyboard-interactive）
+                # 仅在提供了 OTP 时才重建 transport 并通过键盘交互认证
+                # 没提供 OTP 时让异常向上传递，以便 agent 知道需要 2FA 验证码
+                if "keyboard-interactive" in bat.allowed_types and otp:
+                    if not host:
+                        raise ValueError("重建连接需要提供 host 参数")
+                    transport.close()
+                    transport = Transport((host, port))
+                    transport.start_client()
+                    _keyboard_interactive_auth(transport, username, otp, password)
+                else:
+                    raise
             except AuthenticationException:
-                # 密码认证失败，检查后续是否有 otp 需要键盘交互
-                # 但注意：这里捕获异常后继续，不终止
+                # 密码认证失败（密码错误等），不终止
                 if not transport.is_authenticated():
                     raise
 
@@ -148,6 +165,8 @@ def _authenticate(
     # 最终检查认证状态
     if not transport.is_authenticated():
         raise AuthenticationException("认证未完成，认证方法组合可能不满足服务器要求")
+
+    return transport
 
 
 def _keyboard_interactive_auth(
@@ -240,13 +259,15 @@ def connect_ssh(
 
     try:
         # 执行多步认证
-        _authenticate(
+        transport = _authenticate(
             transport,
             username,
             auth_methods,
             password=password,
             private_key=private_key,
             otp=otp,
+            host=host,
+            port=port,
         )
 
         # 将 Transport 挂接到 SSHClient
